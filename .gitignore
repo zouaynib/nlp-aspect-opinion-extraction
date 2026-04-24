@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editors / IDEs
+.idea/
+.vscode/
+
+# Virtual envs (local, shouldn't be in repo)
+venv/
+.venv/
+env/
+
+# Model/training artifacts
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+runs/
+logs/
+wandb/
+
+# HuggingFace cache (if it ever lands in the repo dir)
+.cache/
