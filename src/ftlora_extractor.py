@@ -1,4 +1,5 @@
 import math
+from collections import Counter
 from typing import Literal
 
 import torch
@@ -27,6 +28,28 @@ def _normalize(label: str) -> str:
     """Map noisy annotations (e.g. 'Positive#NE') to one of the 4 canonical labels."""
     head = str(label).split("#")[0].strip()
     return head if head in LABEL2ID else "No Opinion"
+
+
+def _compute_class_weights(train_data: list[dict], dampen: bool = True) -> torch.Tensor:
+    """
+    Returns a [NUM_ASPECTS, NUM_LABELS] float tensor of per-aspect class weights.
+    Each row sums to NUM_LABELS so total loss magnitude stays comparable to the unweighted case.
+    """
+    rows = []
+    for aspect in ASPECTS:
+        counts = Counter(_normalize(d[aspect]) for d in train_data)
+        # +1 Laplace smoothing — defensive against any zero-count class
+        counts_per_label = [counts[label] + 1 for label in LABELS]
+        total = sum(counts_per_label)
+        # inverse-frequency weight: w_c = N / (K * count_c)
+        weights = [total / (NUM_LABELS * c) for c in counts_per_label]
+        if dampen:
+            weights = [math.sqrt(w) for w in weights]
+        # normalize so the row sums to NUM_LABELS (mean weight = 1.0)
+        s = sum(weights)
+        weights = [w * NUM_LABELS / s for w in weights]
+        rows.append(weights)
+    return torch.tensor(rows, dtype=torch.float32)
 
 
 class AspectDataset(Dataset):
@@ -123,6 +146,9 @@ class OpinionExtractor:
         train_ds = AspectDataset(texts, labels, self.tokenizer)
         train_dl = DataLoader(train_ds, batch_size=per_device_batch, shuffle=True)
 
+        # --- per-aspect class weights to counter imbalance ---
+        class_weights = _compute_class_weights(train_data, dampen=True).to(accelerator.device)
+
         # --- optimizer: exclude bias & LayerNorm from weight decay ---
         no_decay = ["bias", "LayerNorm.weight"]
         named = list(self.model.named_parameters())
@@ -153,11 +179,15 @@ class OpinionExtractor:
             for batch in train_dl:
                 with accelerator.accumulate(self.model):
                     logits = self.model(batch["input_ids"], batch["attention_mask"])
-                    # logits: [B, 3, 4]   labels: [B, 3]
-                    loss = F.cross_entropy(
-                        logits.reshape(-1, NUM_LABELS),
-                        batch["labels"].reshape(-1),
-                    )
+                    # logits: [B, 3, 4]   labels: [B, 3]   class_weights: [3, 4]
+                    loss = sum(
+                        F.cross_entropy(
+                            logits[:, a, :],
+                            batch["labels"][:, a],
+                            weight=class_weights[a],
+                        )
+                        for a in range(NUM_ASPECTS)
+                    ) / NUM_ASPECTS
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
