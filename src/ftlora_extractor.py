@@ -146,8 +146,6 @@ class OpinionExtractor:
         train_ds = AspectDataset(texts, labels, self.tokenizer)
         train_dl = DataLoader(train_ds, batch_size=per_device_batch, shuffle=True)
 
-        # --- per-aspect class weights to counter imbalance ---
-        class_weights = _compute_class_weights(train_data, dampen=True).to(accelerator.device)
 
         # --- optimizer: exclude bias & LayerNorm from weight decay ---
         no_decay = ["bias", "LayerNorm.weight"]
@@ -179,15 +177,11 @@ class OpinionExtractor:
             for batch in train_dl:
                 with accelerator.accumulate(self.model):
                     logits = self.model(batch["input_ids"], batch["attention_mask"])
-                    # logits: [B, 3, 4]   labels: [B, 3]   class_weights: [3, 4]
-                    loss = sum(
-                        F.cross_entropy(
-                            logits[:, a, :],
-                            batch["labels"][:, a],
-                            weight=class_weights[a],
-                        )
-                        for a in range(NUM_ASPECTS)
-                    ) / NUM_ASPECTS
+                    # logits: [B, 3, 4]   labels: [B, 3]
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, NUM_LABELS),
+                        batch["labels"].reshape(-1),
+                    )
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
