@@ -1,4 +1,5 @@
 import math
+import re
 from collections import Counter
 from typing import Literal
 
@@ -21,7 +22,7 @@ NUM_LABELS = len(LABELS)
 
 MAX_LENGTH = 256
 
-MODEL_NAME = "flaubert/flaubert_large_cased"
+MODEL_NAME = "almanach/moderncamembert-base"
 
 
 def _normalize(label: str) -> str:
