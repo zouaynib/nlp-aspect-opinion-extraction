@@ -21,7 +21,7 @@ NUM_LABELS = len(LABELS)
 
 MAX_LENGTH = 256
 
-MODEL_NAME = "almanach/moderncamembert-base"
+MODEL_NAME = "flaubert/flaubert_large_cased"
 
 
 def _normalize(label: str) -> str:
@@ -181,6 +181,7 @@ class OpinionExtractor:
                     loss = F.cross_entropy(
                         logits.reshape(-1, NUM_LABELS),
                         batch["labels"].reshape(-1),
+                        label_smoothing=0.1,
                     )
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
