@@ -1,5 +1,4 @@
 import math
-import re
 from collections import Counter
 from typing import Literal
 
@@ -86,6 +85,35 @@ class AspectDataset(Dataset):
         return item
 
 
+class FGM:
+    """
+    Fast Gradient Method adversarial training for NLP fine-tuning.
+    Perturbs the embedding weights along the gradient direction, normalized.
+    Usage per step: clean fwd+bwd -> attack() -> adv fwd+bwd -> restore() -> optim.step().
+    """
+
+    def __init__(self, model: nn.Module, eps: float = 1.0, emb_name: str = "embeddings") -> None:
+        self.model = model
+        self.eps = eps
+        self.emb_name = emb_name
+        self.backup: dict[str, torch.Tensor] = {}
+
+    def attack(self) -> None:
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and self.emb_name in name and param.grad is not None:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm.item() != 0 and not torch.isnan(norm):
+                    r_at = self.eps * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self) -> None:
+        for name, param in self.model.named_parameters():
+            if name in self.backup:
+                param.data = self.backup[name]
+        self.backup = {}
+
+
 class MultiHeadClassifier(nn.Module):
     """
     Shared encoder (CamemBERT/etc.) + 3 independent linear heads, one per aspect.
@@ -170,6 +198,9 @@ class OpinionExtractor:
             self.model, optimizer, train_dl, scheduler
         )
 
+        # --- adversarial training (FGM): perturbs embeddings to improve robustness ---
+        fgm = FGM(self.model, eps=1.0, emb_name="embeddings")
+
         # --- training loop ---
         self.model.train()
         for epoch in range(1, epochs + 1):
@@ -177,6 +208,7 @@ class OpinionExtractor:
             n_batches = 0
             for batch in train_dl:
                 with accelerator.accumulate(self.model):
+                    # 1) clean forward + backward
                     logits = self.model(batch["input_ids"], batch["attention_mask"])
                     # logits: [B, 3, 4]   labels: [B, 3]
                     loss = F.cross_entropy(
@@ -185,6 +217,22 @@ class OpinionExtractor:
                         label_smoothing=0.1,
                     )
                     accelerator.backward(loss)
+
+                    # 2) FGM attack: perturb embeddings along grad direction
+                    fgm.attack()
+
+                    # 3) adversarial forward + backward (grads accumulate on top of clean grads)
+                    logits_adv = self.model(batch["input_ids"], batch["attention_mask"])
+                    loss_adv = F.cross_entropy(
+                        logits_adv.reshape(-1, NUM_LABELS),
+                        batch["labels"].reshape(-1),
+                        label_smoothing=0.1,
+                    )
+                    accelerator.backward(loss_adv)
+
+                    # 4) restore clean embeddings before stepping
+                    fgm.restore()
+
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     optimizer.step()
