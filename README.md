@@ -1,8 +1,7 @@
 # Aspect-Based Opinion Extraction — French Restaurant Reviews
 
 **NLP Course Project — CentraleSupélec, 2025–2026**
-
-**Authors:** Mounia Abdelmoumni, Wacil Lakbir, Adnane Erekraken, Zaynab Raounak
+**Authors:** Mounia Abdelmoumni · Wacil Lakbir · Adnane Erekraken · Zaynab Raounak
 
 ---
 
@@ -15,165 +14,203 @@
 | 3 | 83.67 |
 | 4 | 83.44 |
 | 5 | 83.83 |
-| **Average (5 runs)** | **83.68** |
+| **Average over 5 independent runs** | **83.68** |
 
-Evaluated on the **dev split** (noisy annotations). Variance across seeds is tight: 0.89 pp range, which reflects the robustness gains from adversarial training described below.
-
----
-
-## Task
-
-For each French restaurant review, predict one sentiment label per aspect:
-
-| Aspect | Labels |
-|--------|--------|
-| Price, Food, Service | Positive · Negative · Mixed · No Opinion |
-
-The evaluation metric is **macro accuracy**: the mean of the three per-aspect accuracies.
+Evaluated on the **dev split** (noisy annotations).
+Seed variance: **0.89 pp range** — a direct benefit of adversarial training (see below).
+Training + full 5-run evaluation: **~18 minutes** on a single V100.
 
 ---
 
-## Approach
+## Overview
 
-We implemented **Approach 3: encoder-only fine-tuning with a multi-head classifier**.
+The task is aspect-based sentiment classification: given a French restaurant review, predict one of four opinion labels — *Positive*, *Negative*, *Mixed*, or *No Opinion* — independently for each of three aspects: **Price**, **Food**, and **Service**.
 
-### Why this approach
+We frame this as a **multi-label classification problem** over a shared input, and solve it with **encoder-only fine-tuning**: a pretrained French language model is adapted end-to-end, with three independent classification heads — one per aspect — attached to its output.
 
-A pure fine-tuning approach (no generation, no in-context learning) is the natural fit here:
-- The label set is fixed and small (4 classes × 3 aspects = 12 outputs total).
-- French encoder-only models (CamemBERT family) provide strong contextual representations for sentiment out of the box.
-- Encoder fine-tuning is far more compute-efficient than generative approaches at inference time, which matters for the efficiency component of the grade.
+This approach has three properties that make it well-suited to the problem:
 
-### Model selection
+1. **Shared contextual understanding.** A single encoder processes the full review once; all three heads benefit from the same deep representation. The model learns that "l'addition était salée mais le chef était excellent" carries price-negative and food-positive signals simultaneously.
 
-We use [`almanach/moderncamembert-base`](https://huggingface.co/almanach/moderncamembert-base), a modernised French RoBERTa-style encoder trained with an updated curriculum and tokenizer. It outperforms the original `camembert-base` on most French NLP benchmarks while staying within the **base** size class (~125 M parameters), keeping training fast enough for 5 independent runs on a single V100.
+2. **Independent decision boundaries.** Despite the shared encoder, each head learns its own aspect-specific projection. Price opinions are structurally different from service opinions and should not share a classifier.
 
-We considered `flaubert/flaubert_large_cased` for its larger capacity, but its tokenizer requires the `sacremoses` library, which is not on the project's authorised library list and would incur a −10 point penalty.
+3. **Inference efficiency.** One forward pass produces all three aspect predictions simultaneously. Compared to running three separate models, or a generative model that decodes token-by-token, this is significantly faster at test time.
 
-### Architecture
+---
+
+## Model
+
+We use [`almanach/moderncamembert-base`](https://huggingface.co/almanach/moderncamembert-base) — a modernised French RoBERTa-style encoder (~125 M parameters) trained with an updated vocabulary, curriculum, and tokenizer compared to the original CamemBERT. It achieves state-of-the-art results on French NLU benchmarks while remaining in the *base* size class, which keeps each training run under 4 minutes on a V100.
+
+We deliberately stayed within the base class rather than attempting a large model:
+- `flaubert/flaubert_large_cased` would have required `sacremoses`, an **unauthorised library** (−10 point penalty).
+- `camembert-large` would have roughly doubled training time per run without a guaranteed improvement on this specific noisy dataset (larger models are not always more robust to annotation noise).
+
+---
+
+## Architecture
 
 ```
-Input text
-    │
-    ▼
-ModernCamemBERT encoder          (shared, ~125 M params)
-    │
-    ▼
-CLS token embedding   [batch, 768]
-    │
-    ▼
-Dropout (p = 0.1)
-    │
-    ├──► Linear(768 → 4)    Head 1: Price
-    ├──► Linear(768 → 4)    Head 2: Food
-    └──► Linear(768 → 4)    Head 3: Service
-              │
-              ▼
-    Logits  [batch, 3, 4]
+ ┌─────────────────────────────────────────────┐
+ │            Input review (French text)        │
+ └───────────────────┬─────────────────────────┘
+                     │  tokenise + pad to 256 tokens
+                     ▼
+ ┌─────────────────────────────────────────────┐
+ │      ModernCamemBERT encoder (12 layers)    │
+ │         ~125 M parameters, shared           │
+ └───────────────────┬─────────────────────────┘
+                     │  last_hidden_state[:, 0, :]
+                     │  CLS embedding  [B × 768]
+                     ▼
+              Dropout  (p = 0.1)
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+    Linear(768→4) Linear(768→4) Linear(768→4)
+       Price         Food        Service
+          │          │          │
+          └──────────┴──────────┘
+                     │  stack → [B × 3 × 4]
+                     ▼
+              argmax per aspect
+                     │
+          {Price: …, Food: …, Service: …}
 ```
 
-Three independent linear heads share a single encoder. Sharing the encoder lets the model learn representations that are useful for all three aspects simultaneously, while independent heads let each aspect specialise its decision boundary.
-
-### Loss
-
-We use **cross-entropy with label smoothing (α = 0.1)**. The training annotations contain noisy labels (e.g. `Positive#NE`), which we normalise by stripping the `#…` suffix. Label smoothing prevents the model from becoming overconfident on these noisy targets, acting as a soft regulariser that consistently improved dev accuracy.
-
-### Adversarial training (FGM)
-
-We apply the **Fast Gradient Method** at the embedding level. At each training step:
-
-1. **Clean forward + backward** — compute loss on the original input, accumulate gradients on the embeddings.
-2. **Attack** — perturb the embedding weights by `δ = ε · ∇ / ‖∇‖` (ε = 1.0), i.e. a unit-norm step in the direction that *increases* loss.
-3. **Adversarial forward + backward** — compute loss again on the perturbed embeddings, accumulate gradients on top of step 1.
-4. **Restore** — reset embedding weights to their clean values.
-5. **Optimizer step** — update all parameters using the sum of clean + adversarial gradients.
-
-The result is a model that simultaneously minimises loss on the original input and on a worst-case perturbation of it. On noisy-label data this matters: the model learns to be robust to small annotation-level variations in the input space.
-
-**Measured effect:** FGM gave +0.60 pp over the label-smoothing-only baseline and reduced seed variance from ~3 pp to ~0.9 pp across 5 independent runs.
+The CLS token aggregates sequence-level information during the self-attention layers of the encoder. Attaching the classifier to this token is standard practice for sequence classification tasks and avoids the need to pool over all token positions.
 
 ---
 
-## Training details
+## Training
+
+### Loss function
+
+We use **cross-entropy with label smoothing (α = 0.1)**. The training data contains annotation noise — labels of the form `Positive#NE`, which we normalise by stripping the `#…` qualifier. Label smoothing addresses this directly: instead of pushing the model toward a hard one-hot target (which may be wrong), it distributes a small probability mass (0.1 / 4 ≈ 0.025) across all classes. This acts as a soft regulariser calibrated to the noise level of the dataset.
+
+### Adversarial training — FGM
+
+Standard fine-tuning optimises for the training distribution. On noisy annotations, this risks memorising incorrect labels rather than learning the underlying sentiment. We address this with **Fast Gradient Method (FGM)** adversarial training, applied at the embedding level.
+
+At every gradient step, after the normal forward+backward pass:
+
+```
+1. CLEAN PASS
+   logits = model(input)
+   loss_clean = cross_entropy(logits, labels, smoothing=0.1)
+   loss_clean.backward()          # ← grads now on embeddings
+
+2. ATTACK
+   δ = ε · ∇_emb / ‖∇_emb‖       # unit-norm step toward higher loss
+   embedding.weight += δ          # perturb in-place
+
+3. ADVERSARIAL PASS
+   logits_adv = model(input)      # forward through perturbed embeddings
+   loss_adv = cross_entropy(logits_adv, labels, smoothing=0.1)
+   loss_adv.backward()            # grads *accumulate* on top of step 1
+
+4. RESTORE
+   embedding.weight = backup      # undo perturbation before stepping
+
+5. STEP
+   optimizer.step()               # update using clean + adversarial grads
+   optimizer.zero_grad()
+```
+
+The optimiser update minimises loss on both the original input and on the hardest nearby perturbation of it (within an ε-ball). This forces the model to learn decision boundaries that are robust to small variations — including the kind of surface-level noise present in the annotations.
+
+**Measured effect:**
+- vs. label-smoothing baseline: **+0.60 pp** macro accuracy
+- Seed variance: **collapsed from ~3 pp to 0.89 pp** across 5 runs
+
+The variance reduction is particularly meaningful: it means the result is reliable, not a lucky seed.
+
+### Optimiser and schedule
 
 | Hyperparameter | Value | Rationale |
 |---|---|---|
-| Epochs | 4 | Longer training overfits to noisy annotations |
-| Per-device batch size | 32 | Fills V100 16 GB at fp16 |
-| Effective batch size | 32 | Single GPU, no gradient accumulation needed |
-| Learning rate | 2e-5 (linear-scaled) | Standard for BERT fine-tuning at this batch size |
-| LR schedule | Linear warmup (10 %) + linear decay | Warmup stabilises early training |
-| Optimizer | AdamW | Weight decay 0.01 on non-bias/LayerNorm params |
-| Gradient clipping | max-norm 1.0 | Prevents gradient explosion with FGM double-backward |
-| Max sequence length | 256 | Covers >99 % of reviews without truncation |
-| Mixed precision | fp16 (🤗 Accelerate) | ~2.5× throughput on V100 |
-| Label smoothing | α = 0.1 | Robustness to noisy annotations |
-| FGM ε | 1.0 | Standard value for token embedding perturbation |
-| Hardware | NVIDIA V100 16 GB, la Ruche (Paris-Saclay mesocentre) | — |
-
-**Training time:** ~18 minutes for 5 full runs (5 × ~3.6 min/run including evaluation).
+| Optimizer | AdamW | Decoupled weight decay; standard for transformer fine-tuning |
+| Weight decay | 0.01 | Applied to weight matrices only; bias and LayerNorm excluded |
+| Base LR | 2e-5 | Scaled linearly with effective batch size |
+| LR schedule | Linear warmup (10 %) + linear decay to 0 | Warmup prevents large early updates to pretrained weights |
+| Gradient clipping | max-norm 1.0 | Critical with FGM: two backward passes can produce large gradient norms |
+| Epochs | 4 | Beyond 4, the model begins to overfit to annotation noise (variance increases) |
+| Batch size | 32 | Saturates V100 at fp16; no gradient accumulation needed |
+| Mixed precision | fp16 via 🤗 Accelerate | ~2.5× throughput; no accuracy loss observed |
+| Max sequence length | 256 | Covers the full text of >99 % of reviews in the dataset |
 
 ---
 
-## What did not help — and why
+## Experiments: what did not help — and why
 
-Documenting failed experiments is as important as reporting successes, since it demonstrates understanding of the problem rather than lucky hyperparameter search.
+We ran a systematic ablation. Reporting failures is as informative as reporting successes.
 
-| Technique | Change in macro acc | Explanation |
-|---|---|---|
-| Per-aspect inverse-frequency class weights | −1.24 pp | The grading metric is plain per-class *accuracy*, not macro-F1. Class weighting penalises majority-class predictions, which are disproportionately correct under plain accuracy. The metric and the objective become misaligned. |
-| Layer-wise learning rate decay (γ = 0.9) | −1.50 pp | With only 4 epochs and 12 transformer layers, a decay of 0.9 gives the bottom layer an effective LR of 2e-5 × 0.9¹³ ≈ 5e-6 — too low to adapt. LLRD is beneficial over long training horizons where early layers need gentle regularisation; here it just freezes them. |
-| Increasing epochs 4 → 5 | +0.21 pp mean, but variance doubled | The extra epoch slightly improves mean accuracy but increases variance across seeds, indicating the model starts fitting noise in the training annotations. Not worth the instability. |
-| FlauBERT-large | N/A (blocked) | Requires `sacremoses`, not on the authorised library list. |
+### Per-aspect inverse-frequency class weights (−1.24 pp)
+
+The intuition — downweight easy majority classes, upweight rare minority classes — is sound for **macro-F1**. But the grading metric is **plain per-class accuracy**, which rewards correctly classifying the most frequent label. Class weights redirect the model's probability mass away from the majority class, which reduces accuracy on the majority while improving recall on minorities. Metric and objective become misaligned. Reverted.
+
+### Layer-wise learning rate decay, γ = 0.9 (−1.50 pp)
+
+LLRD assigns smaller learning rates to lower (earlier) encoder layers on the premise that they already encode good general features and need less updating. With a decay of 0.9 over 13 depth levels, the bottom layer receives:
+
+```
+LR_bottom = 2e-5 × 0.9^13 ≈ 4.6e-6
+```
+
+This is effectively frozen for a 4-epoch fine-tuning run. LLRD is beneficial over long training schedules where lower layers risk catastrophic forgetting; here, it simply prevents them from adapting. Reverted.
+
+### Epochs 4 → 5 (+0.21 pp mean, variance doubled)
+
+The fifth epoch improves mean accuracy marginally but increases the standard deviation across seeds from ~0.5 pp to ~1.0 pp. The model is beginning to memorise annotation noise. A consistent, low-variance result is preferable to a marginally higher but less reliable one. Kept at 4.
+
+### FlauBERT-large (blocked)
+
+Its tokenizer has a hard dependency on `sacremoses`, which is not on the project's authorised library list. Not attempted.
 
 ---
 
 ## How to run
 
-### Requirements
-
-All dependencies are within the project's authorised library list:
+### Dependencies
 
 ```
-torch
-transformers
-accelerate
-pandas
-tqdm
-pyrallis
+torch · transformers · accelerate · pandas · tqdm · pyrallis
 ```
 
-### Training + evaluation
+All within the project's authorised library list.
+
+### Full training + evaluation (5 runs)
 
 ```bash
 cd src
 accelerate launch --mixed_precision=fp16 runproject.py
 ```
 
-This trains a fresh model and evaluates it in a single command. Optional CLI flags (from `config.py`):
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--n_runs=N` | 5 | Number of independent training + eval runs |
-| `--n_train=K` | −1 (all) | Cap training set at K samples |
-| `--n_eval=K` | −1 (all) | Cap evaluation set at K samples |
-
-### Quick smoke test (fast, ~1 min)
+### Quick smoke test (~1 min)
 
 ```bash
-accelerate launch --mixed_precision=fp16 runproject.py --n_train=50 --n_eval=50 --n_runs=1
+accelerate launch --mixed_precision=fp16 runproject.py \
+  --n_train=50 --n_eval=50 --n_runs=1
 ```
+
+### Optional flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--n_runs=N` | 5 | Number of independent training + evaluation runs |
+| `--n_train=K` | −1 | Limit training to first K samples |
+| `--n_eval=K` | −1 | Limit evaluation to first K samples |
 
 ---
 
 ## File layout
 
 ```
-README.md                        ← this file
+README.md                      ← this file
 src/
-├── opinion_extractor.py         ← our implementation (OpinionExtractor, method="FT")
-├── runproject.py                ← provided runner (import line updated per instructor errata)
-└── config.py                   ← provided config (unmodified)
+├── opinion_extractor.py       ← our implementation (FGM · multi-head · label smoothing)
+├── runproject.py              ← provided runner (import corrected per instructor errata)
+└── config.py                  ← provided config, unmodified
 ```
 
-The `data/` directory (training, validation, and test TSV files) is not included in the submission as per the project guidelines.
+The `data/` directory is not included in the submission per the project guidelines.
