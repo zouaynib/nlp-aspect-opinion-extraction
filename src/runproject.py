@@ -8,7 +8,7 @@ from tqdm import tqdm
 from config import Config
 import pyrallis
 # from noft_extractor import OpinionExtractor
-from ftlora_extractor import OpinionExtractor
+from opinion_extractor import OpinionExtractor
 
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 # PLEASE DO NOT EDIT/MODIFY THIS FILE
