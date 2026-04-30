@@ -124,7 +124,7 @@ Documenting failed experiments is as important as reporting successes, since it 
 | Per-aspect inverse-frequency class weights | −1.24 pp | The grading metric is plain per-class *accuracy*, not macro-F1. Class weighting penalises majority-class predictions, which are disproportionately correct under plain accuracy. The metric and the objective become misaligned. |
 | Layer-wise learning rate decay (γ = 0.9) | −1.50 pp | With only 4 epochs and 12 transformer layers, a decay of 0.9 gives the bottom layer an effective LR of 2e-5 × 0.9¹³ ≈ 5e-6 — too low to adapt. LLRD is beneficial over long training horizons where early layers need gentle regularisation; here it just freezes them. |
 | Increasing epochs 4 → 5 | +0.21 pp mean, but variance doubled | The extra epoch slightly improves mean accuracy but increases variance across seeds, indicating the model starts fitting noise in the training annotations. Not worth the instability. |
-| FlauBERT-large | N/A (blocked) | Requires `sacremoses`, not on the authorised library list. −10 point penalty would apply. |
+| FlauBERT-large | N/A (blocked) | Requires `sacremoses`, not on the authorised library list. |
 
 ---
 
