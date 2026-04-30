@@ -8,14 +8,14 @@
 
 ## Results
 
-| Run | Price | Food | Service | Macro accuracy |
-|----:|------:|-----:|--------:|---------------:|
-| 1 | — | — | — | 83.28 |
-| 2 | — | — | — | 84.17 |
-| 3 | — | — | — | 83.67 |
-| 4 | — | — | — | 83.44 |
-| 5 | — | — | — | 83.83 |
-| **Average (5 runs)** | | | | **83.68** |
+| Run | Macro accuracy |
+|----:|---------------:|
+| 1 | 83.28 |
+| 2 | 84.17 |
+| 3 | 83.67 |
+| 4 | 83.44 |
+| 5 | 83.83 |
+| **Average (5 runs)** | **83.68** |
 
 Evaluated on the **dev split** (noisy annotations). Variance across seeds is tight: 0.89 pp range, which reflects the robustness gains from adversarial training described below.
 
